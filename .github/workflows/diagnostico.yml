@@ -1,0 +1,32 @@
+name: Diagnostico (manual)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: monitor-qatar
+  cancel-in-progress: false
+
+jobs:
+  diagnostico:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TZ: America/Sao_Paulo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+          sudo apt-get install -y xvfb > /dev/null
+      - run: xvfb-run -a --server-args="-screen 0 1920x1080x24" python diagnostico.py
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostico
+          path: data/diagnostico
+          retention-days: 3
