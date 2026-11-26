@@ -1,8 +1,14 @@
 """
-Monitor de preços Qatar Airways GRU <-> BKK (Economy, 2 adultos).
+Monitor de preços GRU <-> BKK (Econômica, 2 adultos, até 1 conexão por sentido).
 
-Somente CONSULTA: abre o calendário flexível, lê os aria-labels das células
-e nunca clica em nada, nunca preenche dados pessoais ou de pagamento.
+Fontes:
+  1. Qatar Airways (site oficial): calendário flexível, preços exatos.
+  2. Google Flights: calendário "viagens de N dias" (triagem, valores arredondados)
+     + lista de voos para confirmar preço exato e companhia (todas as companhias
+     com até 1 parada, exceto LATAM).
+
+Somente CONSULTA: nunca compra, nunca preenche dados pessoais ou de pagamento.
+Links nos e-mails apontam só para sites oficiais (lista fixa em gflights.OFICIAIS).
 
 Uso:
     python monitor.py            # execução normal (agendada)
@@ -21,7 +27,7 @@ import smtplib
 import ssl
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from html import escape
 from logging.handlers import RotatingFileHandler
@@ -40,6 +46,8 @@ ANO = 2027
 IDA_MIN = date(2027, 3, 15)
 IDA_MAX = date(2027, 4, 30)
 DIAS_MIN, DIAS_MAX = 14, 18
+MAX_CONFIRMACOES = 5   # acessos extras ao Google por execução para preço exato
+FOLGA_ARREDONDAMENTO = 50  # calendário do Google mostra "17,3 mil" (±R$ 50)
 
 PARES = [
     ("2027-03-19", "2027-04-04"),
@@ -76,11 +84,11 @@ def configurar_log() -> None:
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
     fh = RotatingFileHandler(LOGS / "monitor.log", maxBytes=1_000_000, backupCount=5, encoding="utf-8")
     fh.setFormatter(fmt)
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
     log.setLevel(logging.INFO)
     log.addHandler(fh)
     if sys.stdout is not None:  # pythonw não tem console
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
         log.addHandler(sh)
 
 
@@ -93,7 +101,7 @@ def ddmm(d: date) -> str:
     return d.strftime("%d/%m")
 
 
-def url_busca(ida: date | str, volta: date | str, flex: bool) -> str:
+def url_qatar(ida: date | str, volta: date | str, flex: bool) -> str:
     return URL_BASE.format(ida=str(ida), volta=str(volta), flex="true" if flex else "false")
 
 
@@ -133,7 +141,17 @@ def config() -> dict:
     }
 
 
-# -------------------------------------------------------------------- coleta
+def no_periodo(ida: date, volta: date) -> bool:
+    return IDA_MIN <= ida <= IDA_MAX and DIAS_MIN <= (volta - ida).days <= DIAS_MAX
+
+
+def pausa() -> None:
+    s = random.uniform(5, 15)
+    log.info("Aguardando %.1f s", s)
+    time.sleep(s)
+
+
+# -------------------------------------------------------------------- Qatar
 def abrir_contexto(p, canal: str):
     perfil = DATA / f"perfil_{canal}"
     perfil.mkdir(parents=True, exist_ok=True)
@@ -184,25 +202,6 @@ def parse_labels(labels: list[str]) -> list[tuple[date, date, float]]:
     return out
 
 
-def buscar(ctx, ida: str, volta: str) -> list[tuple[date, date, float]]:
-    page = ctx.pages[0] if ctx.pages else ctx.new_page()
-    url = url_busca(ida, volta, flex=True)
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        n = esperar_grade(page)
-        labels = page.eval_on_selector_all(SELETOR, "els => els.map(e => e.getAttribute('aria-label'))")
-        celulas = parse_labels(labels)
-        log.info("Busca %s/%s: %d elementos, %d células válidas (url final: %s)",
-                 ida, volta, n, len(celulas), page.url.split("?")[0])
-        if not celulas:
-            salvar_debug(page, ida)
-        return celulas
-    except Exception as e:
-        log.error("Erro na busca %s/%s: %s", ida, volta, e)
-        salvar_debug(page, ida)
-        return []
-
-
 def salvar_debug(page, nome: str) -> None:
     try:
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
@@ -211,63 +210,125 @@ def salvar_debug(page, nome: str) -> None:
         pass
 
 
-def coletar(cfg: dict, state: dict) -> tuple[list[tuple[date, date, float]], int, int]:
-    """Retorna (células brutas, total de células, número de buscas que falharam)."""
+def buscar_qatar(ctx, ida: str, volta: str) -> list[tuple[date, date, float]]:
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    try:
+        page.goto(url_qatar(ida, volta, flex=True), wait_until="domcontentloaded", timeout=60_000)
+        n = esperar_grade(page)
+        labels = page.eval_on_selector_all(SELETOR, "els => els.map(e => e.getAttribute('aria-label'))")
+        celulas = parse_labels(labels)
+        log.info("Qatar %s/%s: %d elementos, %d células válidas", ida, volta, n, len(celulas))
+        if not celulas:
+            salvar_debug(page, f"qatar_{ida}")
+        return celulas
+    except Exception as e:
+        log.error("Erro na busca Qatar %s/%s: %s", ida, volta, e)
+        salvar_debug(page, f"qatar_{ida}")
+        return []
+
+
+def combos_qatar(celulas) -> list[dict]:
+    melhor: dict[tuple[date, date], float] = {}
+    for ida, volta, preco in celulas:
+        if no_periodo(ida, volta):
+            melhor[(ida, volta)] = min(preco, melhor.get((ida, volta), preco))
+    return [
+        {"ida": i, "volta": v, "dias": (v - i).days, "preco": p, "cia": "Qatar Airways",
+         "conexao": "DOH", "fonte": "qatarairways.com", "link": url_qatar(i, v, flex=False)}
+        for (i, v), p in melhor.items()
+    ]
+
+
+# -------------------------------------------------------------------- coleta
+def coletar(cfg: dict, state: dict) -> dict:
+    """Retorna dict com combos exatos, calendário Google e contadores de falha."""
+    import gflights
     from playwright.sync_api import sync_playwright
 
+    r = {"exatos": [], "cal": {}, "n_qatar": 0, "falhas_qatar": 0, "falhas_google": 0, "confirmacoes": 0}
     canal = state.get("canal") or cfg["canal"]
-    todas: list[tuple[date, date, float]] = []
-    falhas = 0
     with sync_playwright() as p:
         ctx = abrir_contexto(p, canal)
         try:
+            # ---- 1. Qatar (site oficial)
+            celulas = []
             for i, (ida, volta) in enumerate(PARES):
-                if i > 0:
-                    pausa = random.uniform(5, 15)
-                    log.info("Aguardando %.1f s", pausa)
-                    time.sleep(pausa)
-                celulas = buscar(ctx, ida, volta)
-                if not celulas and i == 0 and canal != "chrome":
+                if i:
+                    pausa()
+                c = buscar_qatar(ctx, ida, volta)
+                if not c and i == 0 and canal != "chrome":
                     log.warning("Grade vazia com %s; tentando o Chrome instalado (channel=chrome)", canal)
                     ctx.close()
                     canal = "chrome"
                     ctx = abrir_contexto(p, canal)
-                    time.sleep(random.uniform(5, 15))
-                    celulas = buscar(ctx, ida, volta)
-                    if celulas:
+                    pausa()
+                    c = buscar_qatar(ctx, ida, volta)
+                    if c:
                         state["canal"] = "chrome"
-                if not celulas:
-                    falhas += 1
-                todas.extend(celulas)
+                if not c:
+                    r["falhas_qatar"] += 1
+                celulas.extend(c)
+            r["n_qatar"] = len(celulas)
+            r["exatos"].extend(combos_qatar(celulas))
+
+            # ---- 2. Google Flights: calendário por duração (triagem)
+            page = ctx.pages[0]
+            for dias in range(DIAS_MIN, DIAS_MAX + 1):
+                pausa()
+                try:
+                    cal = gflights.calendario(page, dias, IDA_MIN)
+                    cal = {k: v for k, v in cal.items() if no_periodo(*k)}
+                    log.info("Google calendário %d dias: %d datas", dias, len(cal))
+                    if len(cal) < 40:
+                        r["falhas_google"] += 1
+                        salvar_debug(page, f"google_cal_{dias}")
+                    r["cal"].update(cal)
+                except Exception as e:
+                    log.error("Erro no calendário Google %d dias: %s", dias, e)
+                    salvar_debug(page, f"google_cal_{dias}")
+                    r["falhas_google"] += 1
+
+            # ---- 3. Google Flights: confirmação (preço exato + companhia)
+            if r["cal"]:
+                ordenado = sorted(r["cal"].items(), key=lambda kv: kv[1])
+                alvos = [k for k, v in ordenado if v - FOLGA_ARREDONDAMENTO < cfg["limite"]]
+                if ordenado[0][0] not in alvos:
+                    alvos.insert(0, ordenado[0][0])  # sempre confirma a mais barata
+                for ida, volta in alvos[:MAX_CONFIRMACOES]:
+                    pausa()
+                    try:
+                        for c in gflights.confirmar(page, ida, volta):
+                            if c["cia"] == "Qatar Airways":
+                                c["link"] = url_qatar(ida, volta, flex=False)
+                            r["exatos"].append(c)
+                        r["confirmacoes"] += 1
+                    except Exception as e:
+                        log.error("Erro na confirmação Google %s/%s: %s", ida, volta, e)
+                        salvar_debug(page, f"google_conf_{ida}")
         finally:
             ctx.close()
-    return todas, len(todas), falhas
+    return r
 
 
-def filtrar(celulas: list[tuple[date, date, float]]) -> list[dict]:
-    melhor: dict[tuple[date, date], float] = {}
-    for ida, volta, preco in celulas:
-        dias = (volta - ida).days
-        if IDA_MIN <= ida <= IDA_MAX and DIAS_MIN <= dias <= DIAS_MAX:
-            k = (ida, volta)
-            melhor[k] = min(preco, melhor.get(k, preco))
-    combos = [
-        {"ida": k[0], "volta": k[1], "dias": (k[1] - k[0]).days, "preco": v}
-        for k, v in melhor.items()
-    ]
-    return sorted(combos, key=lambda c: (c["preco"], c["ida"]))
-
-
-def salvar_csv(combos: list[dict]) -> None:
+def salvar_csv(exatos: list[dict], cal: dict) -> None:
     DATA.mkdir(exist_ok=True)
+    cab = ["timestamp", "fonte", "companhia", "ida", "volta", "dias", "preco", "exato"]
+    if CSV_FILE.exists():
+        with CSV_FILE.open(encoding="utf-8") as f:
+            if f.readline().strip().split(";") != cab:
+                CSV_FILE.replace(DATA / "historico_qatar_v1.csv")
     novo = not CSV_FILE.exists()
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with CSV_FILE.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f, delimiter=";")
         if novo:
-            w.writerow(["timestamp", "ida", "volta", "dias", "preco"])
-        for c in combos:
-            w.writerow([ts, c["ida"].isoformat(), c["volta"].isoformat(), c["dias"], f"{c['preco']:.2f}"])
+            w.writerow(cab)
+        for c in exatos:
+            w.writerow([ts, c["fonte"], c["cia"], c["ida"].isoformat(), c["volta"].isoformat(),
+                        c["dias"], f"{c['preco']:.2f}", 1])
+        for (i, v), p in sorted(cal.items()):
+            w.writerow([ts, "Google calendário", "(várias)", i.isoformat(), v.isoformat(),
+                        (v - i).days, f"{p:.2f}", 0])
 
 
 # -------------------------------------------------------------------- e-mail
@@ -295,14 +356,22 @@ def enviar_email(cfg: dict, assunto: str, corpo: str | tuple[str, str]) -> bool:
         return False
 
 
+def cia_txt(c: dict) -> str:
+    return f"{c['cia']} (via {c['conexao']})" if c.get("conexao") else c["cia"]
+
+
+def link_txt(c: dict) -> str:
+    if c.get("link"):
+        return c["link"]
+    return f"(site oficial da {c['cia']})"
+
+
 def linhas_combos(combos: list[dict]) -> str:
-    linhas = []
-    for c in combos:
-        linhas.append(
-            f"- Ida {c['ida']:%d/%m/%Y} | Volta {c['volta']:%d/%m/%Y} | {c['dias']} dias | "
-            f"R$ {brl(c['preco'])} (casal)\n  {url_busca(c['ida'], c['volta'], flex=False)}"
-        )
-    return "\n".join(linhas)
+    return "\n".join(
+        f"- {cia_txt(c)} | Ida {c['ida']:%d/%m/%Y} | Volta {c['volta']:%d/%m/%Y} | {c['dias']} dias | "
+        f"R$ {brl(c['preco'])} (casal)\n  {link_txt(c)}"
+        for c in combos
+    )
 
 
 VERDE, VERMELHO, AZUL, LARANJA = "#1a7f37", "#cf222e", "#0969da", "#bc4c00"
@@ -326,7 +395,6 @@ def montar_email(titulo: str, cor: str, itens: list[tuple[str, str]],
                  rodape: str = "") -> tuple[str, str]:
     """Quadro de resumo no topo + detalhes no final. Retorna (texto, html)."""
     combos = combos or []
-    # ---- texto puro
     largura = max([len(titulo)] + [len(k) + len(v) + 2 for k, v in itens]) + 4
     txt = ["+" + "-" * largura + "+", f"| {titulo.ljust(largura - 2)} |", "+" + "-" * largura + "+"]
     txt += [f"| {(k + ': ' + v).ljust(largura - 2)} |" for k, v in itens]
@@ -335,7 +403,6 @@ def montar_email(titulo: str, cor: str, itens: list[tuple[str, str]],
         txt += ["", "", f"DETALHES - {titulo_detalhes}", "", linhas_combos(combos)]
     if rodape:
         txt += ["", rodape]
-    # ---- html
     linhas = "".join(
         f'<tr><td style="padding:3px 16px 3px 0;color:#57606a;white-space:nowrap">{escape(k)}</td>'
         f'<td style="padding:3px 0;font-weight:600;color:#1f2328">{escape(v)}</td></tr>'
@@ -343,7 +410,7 @@ def montar_email(titulo: str, cor: str, itens: list[tuple[str, str]],
     )
     quadro = (
         f'<div style="border:2px solid {cor};border-left-width:8px;border-radius:8px;padding:16px 20px;'
-        f'max-width:600px;background:#f6f8fa;margin-bottom:28px">'
+        f'max-width:640px;background:#f6f8fa;margin-bottom:28px">'
         f'<div style="font-size:19px;font-weight:700;color:{cor};margin-bottom:10px">{escape(titulo)}</div>'
         f'<table style="border-collapse:collapse;font-size:15px">{linhas}</table></div>'
     )
@@ -351,19 +418,25 @@ def montar_email(titulo: str, cor: str, itens: list[tuple[str, str]],
     if combos:
         th = 'style="text-align:left;padding:6px 10px;border-bottom:2px solid #d0d7de;color:#57606a"'
         td = 'style="padding:6px 10px;border-bottom:1px solid #eaeef2"'
+
+        def link_html(c):
+            if c.get("link"):
+                rot = "abrir busca" if "qatarairways.com" in c["link"] and "departing=" in c["link"] else "site oficial"
+                return f'<a href="{escape(c["link"])}">{rot}</a>'
+            return "—"
+
         corpo_tab = "".join(
-            f'<tr><td {td}>{c["ida"]:%d/%m/%Y}</td><td {td}>{c["volta"]:%d/%m/%Y}</td>'
-            f'<td {td} align="center">{c["dias"]}</td>'
-            f'<td {td} align="right"><b>R$ {brl(c["preco"])}</b></td>'
-            f'<td {td}><a href="{escape(url_busca(c["ida"], c["volta"], flex=False))}">abrir busca</a></td></tr>'
+            f'<tr><td {td}>{escape(cia_txt(c))}</td><td {td}>{c["ida"]:%d/%m/%Y}</td>'
+            f'<td {td}>{c["volta"]:%d/%m/%Y}</td><td {td} align="center">{c["dias"]}</td>'
+            f'<td {td} align="right"><b>R$ {brl(c["preco"])}</b></td><td {td}>{link_html(c)}</td></tr>'
             for c in combos
         )
         det = (
             f'<div style="font-size:15px;font-weight:700;color:#1f2328;margin-bottom:8px">'
             f'Detalhes — {escape(titulo_detalhes)}</div>'
-            f'<table style="border-collapse:collapse;font-size:14px;max-width:600px">'
-            f'<tr><th {th}>Ida</th><th {th}>Volta</th><th {th}>Dias</th><th {th}>Preço (casal)</th>'
-            f'<th {th}>Link</th></tr>{corpo_tab}</table>'
+            f'<table style="border-collapse:collapse;font-size:14px;max-width:760px">'
+            f'<tr><th {th}>Companhia</th><th {th}>Ida</th><th {th}>Volta</th><th {th}>Dias</th>'
+            f'<th {th}>Preço (casal)</th><th {th}>Link</th></tr>{corpo_tab}</table>'
         )
     rod = f'<p style="color:#57606a;font-size:12px;margin-top:20px">{escape(rodape)}</p>' if rodape else ""
     html = (f'<html><body style="font-family:Segoe UI,Arial,sans-serif;color:#1f2328">'
@@ -371,8 +444,10 @@ def montar_email(titulo: str, cor: str, itens: list[tuple[str, str]],
     return "\n".join(txt), html
 
 
-RODAPE = ("Total para 2 adultos, Economy, GRU-BKK ida e volta. Os links abrem a busca "
-          "com as datas exatas (flexibleDate=false). Somente consulta.")
+RODAPE = ("Total para 2 adultos, Econômica, GRU-BKK ida e volta, até 1 conexão em cada sentido, sem LATAM. "
+          "Links somente para sites oficiais: a Qatar abre a busca com as datas exatas; nas demais, "
+          "informe as datas na página da companhia. Preços das outras companhias vêm do Google Flights "
+          "e podem variar um pouco no site oficial. Somente consulta.")
 
 
 def agora() -> str:
@@ -381,36 +456,49 @@ def agora() -> str:
 
 def email_alerta(cfg: dict, abaixo: list[dict], prefixo: str = "") -> bool:
     m = abaixo[0]
-    assunto = (f"{prefixo}ALERTA Qatar GRU-BKK abaixo de R${brl(cfg['limite']).split(',')[0]}: "
-               f"menor R${brl(m['preco'])} ({ddmm(m['ida'])}-{ddmm(m['volta'])})")
+    assunto = (f"{prefixo}ALERTA GRU-BKK abaixo de R${brl(cfg['limite']).split(',')[0]}: "
+               f"menor R${brl(m['preco'])} {m['cia']} ({ddmm(m['ida'])}-{ddmm(m['volta'])})")
     itens = [
         ("Menor preço", f"R$ {brl(m['preco'])}"),
+        ("Companhia", cia_txt(m)),
         ("Datas", datas_txt(m)),
         ("Economia", dif_limite(m["preco"], cfg["limite"])),
-        ("Combinações abaixo", str(len(abaixo))),
+        ("Opções abaixo", f"{len(abaixo)} ({len({c['cia'] for c in abaixo})} companhia(s))"),
         ("Limite", f"R$ {brl(cfg['limite'])}"),
         ("Verificado em", agora()),
     ]
     corpo = montar_email("✈ PREÇO ABAIXO DO LIMITE", VERDE, itens, abaixo,
-                         "combinações abaixo do limite (da mais barata para a mais cara)", RODAPE)
+                         "opções abaixo do limite (da mais barata para a mais cara)", RODAPE)
     return enviar_email(cfg, assunto, corpo)
 
 
 # ---------------------------------------------------------------------- main
-def imprimir(combos: list[dict], limite: float, n_celulas: int, falhas: int) -> None:
-    print("\n" + "=" * 72)
-    print(f"Células lidas: {n_celulas} | buscas com falha: {falhas}/{len(PARES)} | "
-          f"combinações válidas (ida 15/03-30/04, 14-18 dias): {len(combos)}")
-    if combos:
-        print(f"Menor preço: R$ {brl(combos[0]['preco'])}  |  limite: R$ {brl(limite)}")
-        print("-" * 72)
-        print(f"{'IDA':<12}{'VOLTA':<12}{'DIAS':>5}{'PREÇO (casal)':>20}")
-        for c in combos[:20]:
+def por_cia(exatos: list[dict]) -> list[dict]:
+    """Menor preço de cada companhia."""
+    m: dict[str, dict] = {}
+    for c in exatos:
+        if c["cia"] not in m or c["preco"] < m[c["cia"]]["preco"]:
+            m[c["cia"]] = c
+    return sorted(m.values(), key=lambda c: c["preco"])
+
+
+def imprimir(r: dict, exatos: list[dict], limite: float) -> None:
+    print("\n" + "=" * 78)
+    print(f"Qatar: {r['n_qatar']} células, {len(PARES) - r['falhas_qatar']}/{len(PARES)} grades | "
+          f"Google: {len(r['cal'])} datas no calendário, {r['confirmacoes']} confirmações, "
+          f"{r['falhas_google']} falhas")
+    if r["cal"]:
+        (i, v), p = min(r["cal"].items(), key=lambda kv: kv[1])
+        print(f"Menor no calendário Google (arredondado): ~R$ {brl(p)} em {i:%d/%m}-{v:%d/%m}")
+    if exatos:
+        print(f"Menor preço exato: R$ {brl(exatos[0]['preco'])} {cia_txt(exatos[0])}  |  limite: R$ {brl(limite)}")
+        print("-" * 78)
+        print("MENOR PREÇO POR COMPANHIA")
+        for c in por_cia(exatos):
             marca = "  <== ABAIXO" if c["preco"] < limite else ""
-            print(f"{c['ida']:%d/%m/%Y}  {c['volta']:%d/%m/%Y}  {c['dias']:>4}   R$ {brl(c['preco']):>14}{marca}")
-        if len(combos) > 20:
-            print(f"... (+{len(combos) - 20} combinações)")
-    print("=" * 72 + "\n")
+            print(f"  {cia_txt(c):<32}{c['ida']:%d/%m}-{c['volta']:%d/%m} ({c['dias']}d)  "
+                  f"R$ {brl(c['preco']):>12}{marca}")
+    print("=" * 78 + "\n")
 
 
 def main() -> int:
@@ -424,70 +512,75 @@ def main() -> int:
     log.info("Início da execução%s (limite R$ %s)", " [TESTE]" if args.teste else "", brl(cfg["limite"]))
 
     try:
-        celulas, n_celulas, falhas = coletar(cfg, state)
+        r = coletar(cfg, state)
     except Exception as e:
         log.exception("Erro geral na coleta: %s", e)
-        celulas, n_celulas, falhas = [], 0, len(PARES)
+        r = {"exatos": [], "cal": {}, "n_qatar": 0, "falhas_qatar": len(PARES),
+             "falhas_google": DIAS_MAX - DIAS_MIN + 1, "confirmacoes": 0}
 
-    combos = filtrar(celulas)
-    if combos:
-        salvar_csv(combos)
-    abaixo = [c for c in combos if c["preco"] < cfg["limite"]]
-    menor = combos[0]["preco"] if combos else None
-    log.info("Resumo: %d células, %d combinações válidas, %d abaixo do limite, menor %s, falhas %d",
-             n_celulas, len(combos), len(abaixo), f"R$ {brl(menor)}" if menor else "-", falhas)
+    exatos = sorted(r["exatos"], key=lambda c: (c["preco"], c["ida"], c["cia"]))
+    salvar_csv(exatos, r["cal"])
+    abaixo = [c for c in exatos if c["preco"] < cfg["limite"]]
+    menor = exatos[0]["preco"] if exatos else None
+    falhas = r["falhas_qatar"] + r["falhas_google"]
+    log.info("Resumo: %d preços exatos, %d datas no calendário Google, %d abaixo do limite, menor %s, falhas %d",
+             len(exatos), len(r["cal"]), len(abaixo),
+             f"R$ {brl(menor)} {exatos[0]['cia']}" if exatos else "-", falhas)
 
     if args.teste:
-        imprimir(combos, cfg["limite"], n_celulas, falhas)
+        imprimir(r, exatos, cfg["limite"])
         if abaixo:
             ok = email_alerta(cfg, abaixo, prefixo="[TESTE] ")
         else:
-            itens = [("Status", "funcionando" if falhas == 0 else f"{falhas}/{len(PARES)} buscas com falha")]
-            if combos:
+            itens = [("Status", "funcionando" if falhas == 0 else
+                      f"falhas: Qatar {r['falhas_qatar']}/{len(PARES)}, Google {r['falhas_google']}/5")]
+            if exatos:
                 itens += [
                     ("Menor preço", f"R$ {brl(menor)}"),
-                    ("Datas", datas_txt(combos[0])),
+                    ("Companhia", cia_txt(exatos[0])),
+                    ("Datas", datas_txt(exatos[0])),
                     ("Situação", dif_limite(menor, cfg["limite"])),
                 ]
             else:
                 itens.append(("Menor preço", "nenhum encontrado"))
             itens += [
                 ("Limite", f"R$ {brl(cfg['limite'])}"),
-                ("Células lidas", f"{n_celulas} ({len(combos)} combinações válidas)"),
+                ("Cobertura", f"Qatar {r['n_qatar']} células + Google {len(r['cal'])} datas"),
                 ("Verificado em", agora()),
             ]
-            corpo = montar_email("🧪 TESTE — Monitor Qatar GRU-BKK", AZUL, itens, combos[:10],
-                                 "10 combinações mais baratas", RODAPE)
-            ok = enviar_email(cfg, "[TESTE] Monitor Qatar GRU-BKK funcionando", corpo)
+            corpo = montar_email("🧪 TESTE — Monitor GRU-BKK", AZUL, itens, por_cia(exatos),
+                                 "menor preço encontrado por companhia", RODAPE)
+            ok = enviar_email(cfg, "[TESTE] Monitor GRU-BKK funcionando", corpo)
         print("E-mail de teste:", "ENVIADO" if ok else "NÃO ENVIADO (veja logs/monitor.log)")
-        salvar_state(state)  # guarda apenas o canal do navegador, se mudou
+        salvar_state(state)
         return 0
 
     # ---- controle de falhas
     hoje = date.today().isoformat()
-    if n_celulas == 0 or falhas > 0:
+    if not exatos or falhas > 0:
         state["falhas_seguidas"] = state.get("falhas_seguidas", 0) + 1
         log.warning("Execução com falha (%d seguidas)", state["falhas_seguidas"])
         if state["falhas_seguidas"] >= 3 and state.get("ultimo_aviso_problema") != hoje:
             corpo = montar_email("⚠ MONITOR COM PROBLEMA", LARANJA, [
                 ("Falhas seguidas", str(state["falhas_seguidas"])),
-                ("Última execução", f"{n_celulas} células lidas, {falhas}/{len(PARES)} buscas com falha"),
+                ("Qatar", f"{r['n_qatar']} células, {r['falhas_qatar']}/{len(PARES)} grades com falha"),
+                ("Google", f"{len(r['cal'])} datas, {r['falhas_google']}/5 calendários com falha"),
                 ("Verificado em", agora()),
                 ("Log e capturas", onde_ver()),
             ], rodape="Este aviso é enviado no máximo 1 vez por dia.")
-            if enviar_email(cfg, "Monitor Qatar GRU-BKK com problema", corpo):
+            if enviar_email(cfg, "Monitor GRU-BKK com problema", corpo):
                 state["ultimo_aviso_problema"] = hoje
     else:
         state["falhas_seguidas"] = 0
 
     # ---- alertas de preço (anti-spam)
     if abaixo:
-        chaves = {f"{c['ida']}|{c['volta']}" for c in abaixo}
+        chaves = {f"{c['ida']}|{c['volta']}|{c['cia']}" for c in abaixo}
         avisadas = set(state.get("combos_avisadas", []))
         ultimo = state.get("menor_avisado")
         novas = chaves - avisadas
         if ultimo is None or menor < ultimo or novas:
-            log.info("Disparando alerta (menor %s, último avisado %s, combinações novas %d)",
+            log.info("Disparando alerta (menor %s, último avisado %s, opções novas %d)",
                      brl(menor), brl(ultimo) if ultimo else "-", len(novas))
             if email_alerta(cfg, abaixo):
                 state["menor_avisado"] = menor
@@ -495,16 +588,17 @@ def main() -> int:
                 state["abaixo"] = True
         else:
             log.info("Abaixo do limite, mas nada novo desde o último aviso (R$ %s)", brl(ultimo))
-    elif state.get("abaixo") and falhas == 0 and combos:
-        # só conclui que subiu se todas as 5 grades carregaram
+    elif state.get("abaixo") and falhas == 0 and exatos:
+        # só conclui que subiu se todas as fontes carregaram
         corpo = montar_email("↑ PREÇO VOLTOU A SUBIR", VERMELHO, [
             ("Menor preço agora", f"R$ {brl(menor)}"),
-            ("Datas", datas_txt(combos[0])),
+            ("Companhia", cia_txt(exatos[0])),
+            ("Datas", datas_txt(exatos[0])),
             ("Situação", dif_limite(menor, cfg["limite"])),
             ("Último avisado", f"R$ {brl(state.get('menor_avisado') or 0)}"),
             ("Verificado em", agora()),
-        ], combos[:5], "5 combinações mais baratas agora", RODAPE)
-        if enviar_email(cfg, f"Qatar GRU-BKK voltou a subir: menor R${brl(menor)}", corpo):
+        ], por_cia(exatos), "menor preço agora por companhia", RODAPE)
+        if enviar_email(cfg, f"GRU-BKK voltou a subir: menor R${brl(menor)}", corpo):
             state.update(abaixo=False, menor_avisado=None, combos_avisadas=[])
 
     state["ultima_execucao"] = datetime.now().isoformat(timespec="seconds")

@@ -1,4 +1,4 @@
-name: Monitor Qatar GRU-BKK
+name: Monitor GRU-BKK
 
 on:
   schedule:
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     env:
       TZ: America/Sao_Paulo
       SMTP_USER: ${{ secrets.SMTP_USER }}
