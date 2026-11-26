@@ -47,7 +47,9 @@ IDA_MIN = date(2027, 3, 15)
 IDA_MAX = date(2027, 4, 30)
 DIAS_MIN, DIAS_MAX = 14, 18
 MAX_CONFIRMACOES = 5   # acessos extras ao Google por execução para preço exato
-FOLGA_ARREDONDAMENTO = 50  # calendário do Google mostra "17,3 mil" (±R$ 50)
+# O calendário do Google é arredondado ("17,3 mil") e pode estar defasado em centenas
+# de reais; confirma (até MAX_CONFIRMACOES) toda data que fique até esta margem do limite.
+FOLGA_ARREDONDAMENTO = 1000
 
 PARES = [
     ("2027-03-19", "2027-04-04"),
