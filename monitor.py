@@ -125,7 +125,7 @@ def config() -> dict:
         limite_txt = limite_txt.replace(".", "").replace(",", ".")
     return {
         "user": os.getenv("SMTP_USER", "").strip(),
-        "senha": os.getenv("SMTP_APP_PASSWORD", "").replace(" ", "").strip(),
+        "senha": os.getenv("SMTP_APP_PASSWORD", "").replace(" ", "").replace("﻿", "").strip(),
         "para": [e.strip() for e in os.getenv("EMAIL_TO", "").split(",") if e.strip()],
         "limite": float(limite_txt),
         "canal": os.getenv("BROWSER_CHANNEL", "chromium").strip().lower(),
