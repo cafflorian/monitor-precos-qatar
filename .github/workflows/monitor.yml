@@ -1,0 +1,79 @@
+name: Monitor Qatar GRU-BKK
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # a cada hora, no minuto 17 (UTC) - evita o pico do minuto 0
+  workflow_dispatch:
+    inputs:
+      teste:
+        description: "Rodar em modo --teste (imprime e manda e-mail de teste)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: monitor-qatar
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TZ: America/Sao_Paulo
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+      LIMITE: ${{ vars.LIMITE || '17338.00' }}
+      BROWSER_CHANNEL: ${{ vars.BROWSER_CHANNEL || 'chromium' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependências
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+          sudo apt-get install -y xvfb > /dev/null
+
+      - name: Restaurar estado (state.json, histórico, perfil do navegador)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data
+            logs
+          key: estado-${{ github.run_id }}
+          restore-keys: estado-
+
+      - name: Rodar monitor
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.teste }}" = "true" ]; then
+            xvfb-run -a --server-args="-screen 0 1920x1080x24" python monitor.py --teste
+          else
+            xvfb-run -a --server-args="-screen 0 1920x1080x24" python monitor.py
+          fi
+
+      - name: Salvar estado
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data
+            logs
+          key: estado-${{ github.run_id }}
+
+      - name: Publicar histórico, logs e capturas
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: historico-e-logs
+          path: |
+            data/historico.csv
+            data/state.json
+            data/debug
+            logs
+          retention-days: 7
+          if-no-files-found: ignore
