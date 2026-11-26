@@ -23,6 +23,7 @@ import sys
 import time
 from datetime import date, datetime
 from email.message import EmailMessage
+from html import escape
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -270,15 +271,19 @@ def salvar_csv(combos: list[dict]) -> None:
 
 
 # -------------------------------------------------------------------- e-mail
-def enviar_email(cfg: dict, assunto: str, corpo: str) -> bool:
+def enviar_email(cfg: dict, assunto: str, corpo: str | tuple[str, str]) -> bool:
+    """corpo: texto puro, ou (texto, html) montado por montar_email()."""
     if not (cfg["user"] and cfg["senha"] and cfg["para"]):
         log.error("E-mail não enviado: preencha SMTP_USER, SMTP_APP_PASSWORD e EMAIL_TO (.env local ou Secrets do GitHub)")
         return False
+    texto, html = corpo if isinstance(corpo, tuple) else (corpo, None)
     msg = EmailMessage()
     msg["Subject"] = assunto
     msg["From"] = cfg["user"]
     msg["To"] = ", ".join(cfg["para"])
-    msg.set_content(corpo)
+    msg.set_content(texto)
+    if html:
+        msg.add_alternative(html, subtype="html")
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=30) as s:
             s.login(cfg["user"], cfg["senha"])
@@ -300,16 +305,94 @@ def linhas_combos(combos: list[dict]) -> str:
     return "\n".join(linhas)
 
 
+VERDE, VERMELHO, AZUL, LARANJA = "#1a7f37", "#cf222e", "#0969da", "#bc4c00"
+
+
+def datas_txt(c: dict) -> str:
+    return f"{c['ida']:%d/%m/%Y} → {c['volta']:%d/%m/%Y} ({c['dias']} dias)"
+
+
+def dif_limite(preco: float, limite: float) -> str:
+    d = preco - limite
+    if d < 0:
+        return f"R$ {brl(-d)} abaixo do limite"
+    if d == 0:
+        return "igual ao limite"
+    return f"R$ {brl(d)} acima do limite"
+
+
+def montar_email(titulo: str, cor: str, itens: list[tuple[str, str]],
+                 combos: list[dict] | None = None, titulo_detalhes: str = "",
+                 rodape: str = "") -> tuple[str, str]:
+    """Quadro de resumo no topo + detalhes no final. Retorna (texto, html)."""
+    combos = combos or []
+    # ---- texto puro
+    largura = max([len(titulo)] + [len(k) + len(v) + 2 for k, v in itens]) + 4
+    txt = ["+" + "-" * largura + "+", f"| {titulo.ljust(largura - 2)} |", "+" + "-" * largura + "+"]
+    txt += [f"| {(k + ': ' + v).ljust(largura - 2)} |" for k, v in itens]
+    txt.append("+" + "-" * largura + "+")
+    if combos:
+        txt += ["", "", f"DETALHES - {titulo_detalhes}", "", linhas_combos(combos)]
+    if rodape:
+        txt += ["", rodape]
+    # ---- html
+    linhas = "".join(
+        f'<tr><td style="padding:3px 16px 3px 0;color:#57606a;white-space:nowrap">{escape(k)}</td>'
+        f'<td style="padding:3px 0;font-weight:600;color:#1f2328">{escape(v)}</td></tr>'
+        for k, v in itens
+    )
+    quadro = (
+        f'<div style="border:2px solid {cor};border-left-width:8px;border-radius:8px;padding:16px 20px;'
+        f'max-width:600px;background:#f6f8fa;margin-bottom:28px">'
+        f'<div style="font-size:19px;font-weight:700;color:{cor};margin-bottom:10px">{escape(titulo)}</div>'
+        f'<table style="border-collapse:collapse;font-size:15px">{linhas}</table></div>'
+    )
+    det = ""
+    if combos:
+        th = 'style="text-align:left;padding:6px 10px;border-bottom:2px solid #d0d7de;color:#57606a"'
+        td = 'style="padding:6px 10px;border-bottom:1px solid #eaeef2"'
+        corpo_tab = "".join(
+            f'<tr><td {td}>{c["ida"]:%d/%m/%Y}</td><td {td}>{c["volta"]:%d/%m/%Y}</td>'
+            f'<td {td} align="center">{c["dias"]}</td>'
+            f'<td {td} align="right"><b>R$ {brl(c["preco"])}</b></td>'
+            f'<td {td}><a href="{escape(url_busca(c["ida"], c["volta"], flex=False))}">abrir busca</a></td></tr>'
+            for c in combos
+        )
+        det = (
+            f'<div style="font-size:15px;font-weight:700;color:#1f2328;margin-bottom:8px">'
+            f'Detalhes — {escape(titulo_detalhes)}</div>'
+            f'<table style="border-collapse:collapse;font-size:14px;max-width:600px">'
+            f'<tr><th {th}>Ida</th><th {th}>Volta</th><th {th}>Dias</th><th {th}>Preço (casal)</th>'
+            f'<th {th}>Link</th></tr>{corpo_tab}</table>'
+        )
+    rod = f'<p style="color:#57606a;font-size:12px;margin-top:20px">{escape(rodape)}</p>' if rodape else ""
+    html = (f'<html><body style="font-family:Segoe UI,Arial,sans-serif;color:#1f2328">'
+            f'{quadro}{det}{rod}</body></html>')
+    return "\n".join(txt), html
+
+
+RODAPE = ("Total para 2 adultos, Economy, GRU-BKK ida e volta. Os links abrem a busca "
+          "com as datas exatas (flexibleDate=false). Somente consulta.")
+
+
+def agora() -> str:
+    return f"{datetime.now():%d/%m/%Y %H:%M}"
+
+
 def email_alerta(cfg: dict, abaixo: list[dict], prefixo: str = "") -> bool:
     m = abaixo[0]
     assunto = (f"{prefixo}ALERTA Qatar GRU-BKK abaixo de R${brl(cfg['limite']).split(',')[0]}: "
                f"menor R${brl(m['preco'])} ({ddmm(m['ida'])}-{ddmm(m['volta'])})")
-    corpo = (
-        f"Combinações abaixo do limite de R$ {brl(cfg['limite'])} (total para 2 adultos, Economy, "
-        f"GRU-BKK ida e volta), da mais barata para a mais cara:\n\n{linhas_combos(abaixo)}\n\n"
-        f"Verificado em {datetime.now():%d/%m/%Y %H:%M}.\n"
-        "Os links abrem a busca com as datas exatas (flexibleDate=false)."
-    )
+    itens = [
+        ("Menor preço", f"R$ {brl(m['preco'])}"),
+        ("Datas", datas_txt(m)),
+        ("Economia", dif_limite(m["preco"], cfg["limite"])),
+        ("Combinações abaixo", str(len(abaixo))),
+        ("Limite", f"R$ {brl(cfg['limite'])}"),
+        ("Verificado em", agora()),
+    ]
+    corpo = montar_email("✈ PREÇO ABAIXO DO LIMITE", VERDE, itens, abaixo,
+                         "combinações abaixo do limite (da mais barata para a mais cara)", RODAPE)
     return enviar_email(cfg, assunto, corpo)
 
 
@@ -359,14 +442,22 @@ def main() -> int:
         if abaixo:
             ok = email_alerta(cfg, abaixo, prefixo="[TESTE] ")
         else:
-            top = combos[:10]
-            corpo = (
-                "E-mail de TESTE do monitor Qatar GRU-BKK.\n\n"
-                f"Células lidas: {n_celulas} | buscas com falha: {falhas}/{len(PARES)}\n"
-                f"Limite: R$ {brl(cfg['limite'])}\n"
-                f"Menor preço encontrado: {'R$ ' + brl(menor) if menor else 'nenhum'}\n\n"
-                f"10 combinações mais baratas:\n\n{linhas_combos(top) or '(nenhuma)'}\n"
-            )
+            itens = [("Status", "funcionando" if falhas == 0 else f"{falhas}/{len(PARES)} buscas com falha")]
+            if combos:
+                itens += [
+                    ("Menor preço", f"R$ {brl(menor)}"),
+                    ("Datas", datas_txt(combos[0])),
+                    ("Situação", dif_limite(menor, cfg["limite"])),
+                ]
+            else:
+                itens.append(("Menor preço", "nenhum encontrado"))
+            itens += [
+                ("Limite", f"R$ {brl(cfg['limite'])}"),
+                ("Células lidas", f"{n_celulas} ({len(combos)} combinações válidas)"),
+                ("Verificado em", agora()),
+            ]
+            corpo = montar_email("🧪 TESTE — Monitor Qatar GRU-BKK", AZUL, itens, combos[:10],
+                                 "10 combinações mais baratas", RODAPE)
             ok = enviar_email(cfg, "[TESTE] Monitor Qatar GRU-BKK funcionando", corpo)
         print("E-mail de teste:", "ENVIADO" if ok else "NÃO ENVIADO (veja logs/monitor.log)")
         salvar_state(state)  # guarda apenas o canal do navegador, se mudou
@@ -378,12 +469,12 @@ def main() -> int:
         state["falhas_seguidas"] = state.get("falhas_seguidas", 0) + 1
         log.warning("Execução com falha (%d seguidas)", state["falhas_seguidas"])
         if state["falhas_seguidas"] >= 3 and state.get("ultimo_aviso_problema") != hoje:
-            corpo = (
-                f"O monitor Qatar GRU-BKK falhou {state['falhas_seguidas']} vezes seguidas.\n"
-                f"Última execução: {n_celulas} células lidas, {falhas}/{len(PARES)} buscas com falha.\n\n"
-                f"Veja o log e as capturas de tela em: {onde_ver()}\n"
-                "Este aviso é enviado no máximo 1 vez por dia."
-            )
+            corpo = montar_email("⚠ MONITOR COM PROBLEMA", LARANJA, [
+                ("Falhas seguidas", str(state["falhas_seguidas"])),
+                ("Última execução", f"{n_celulas} células lidas, {falhas}/{len(PARES)} buscas com falha"),
+                ("Verificado em", agora()),
+                ("Log e capturas", onde_ver()),
+            ], rodape="Este aviso é enviado no máximo 1 vez por dia.")
             if enviar_email(cfg, "Monitor Qatar GRU-BKK com problema", corpo):
                 state["ultimo_aviso_problema"] = hoje
     else:
@@ -406,12 +497,13 @@ def main() -> int:
             log.info("Abaixo do limite, mas nada novo desde o último aviso (R$ %s)", brl(ultimo))
     elif state.get("abaixo") and falhas == 0 and combos:
         # só conclui que subiu se todas as 5 grades carregaram
-        corpo = (
-            f"Os preços voltaram a ficar acima do limite de R$ {brl(cfg['limite'])}.\n"
-            f"Menor preço agora: R$ {brl(menor)} ({ddmm(combos[0]['ida'])}-{ddmm(combos[0]['volta'])}).\n"
-            f"Último preço avisado: R$ {brl(state.get('menor_avisado') or 0)}.\n\n"
-            f"5 mais baratas agora:\n\n{linhas_combos(combos[:5])}\n"
-        )
+        corpo = montar_email("↑ PREÇO VOLTOU A SUBIR", VERMELHO, [
+            ("Menor preço agora", f"R$ {brl(menor)}"),
+            ("Datas", datas_txt(combos[0])),
+            ("Situação", dif_limite(menor, cfg["limite"])),
+            ("Último avisado", f"R$ {brl(state.get('menor_avisado') or 0)}"),
+            ("Verificado em", agora()),
+        ], combos[:5], "5 combinações mais baratas agora", RODAPE)
         if enviar_email(cfg, f"Qatar GRU-BKK voltou a subir: menor R${brl(menor)}", corpo):
             state.update(abaixo=False, menor_avisado=None, combos_avisadas=[])
 
