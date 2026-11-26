@@ -272,7 +272,7 @@ def salvar_csv(combos: list[dict]) -> None:
 # -------------------------------------------------------------------- e-mail
 def enviar_email(cfg: dict, assunto: str, corpo: str) -> bool:
     if not (cfg["user"] and cfg["senha"] and cfg["para"]):
-        log.error("E-mail não enviado: preencha SMTP_USER, SMTP_APP_PASSWORD e EMAIL_TO no .env")
+        log.error("E-mail não enviado: preencha SMTP_USER, SMTP_APP_PASSWORD e EMAIL_TO (.env local ou Secrets do GitHub)")
         return False
     msg = EmailMessage()
     msg["Subject"] = assunto
