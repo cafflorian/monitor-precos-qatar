@@ -279,6 +279,10 @@ def coletar(cfg: dict, state: dict) -> dict:
                 pausa(15, 30)  # o Google responde "Algo deu errado" com acessos muito seguidos
                 try:
                     cal = gflights.calendario(page, dias, IDA_MIN)
+                    if len(cal) < 40:  # costuma falhar no 1º acesso; tenta a página de novo
+                        log.warning("Calendário %d dias vazio; recarregando a busca", dias)
+                        pausa(15, 30)
+                        cal = gflights.calendario(page, dias, IDA_MIN)
                     cal = {k: v for k, v in cal.items() if no_periodo(*k)}
                     log.info("Google calendário %d dias: %d datas", dias, len(cal))
                     if len(cal) < 40:
