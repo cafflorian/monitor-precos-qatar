@@ -147,8 +147,8 @@ def no_periodo(ida: date, volta: date) -> bool:
     return IDA_MIN <= ida <= IDA_MAX and DIAS_MIN <= (volta - ida).days <= DIAS_MAX
 
 
-def pausa() -> None:
-    s = random.uniform(5, 15)
+def pausa(minimo: float = 5, maximo: float = 15) -> None:
+    s = random.uniform(minimo, maximo)
     log.info("Aguardando %.1f s", s)
     time.sleep(s)
 
@@ -276,7 +276,7 @@ def coletar(cfg: dict, state: dict) -> dict:
             # ---- 2. Google Flights: calendário por duração (triagem)
             page = ctx.pages[0]
             for dias in range(DIAS_MIN, DIAS_MAX + 1):
-                pausa()
+                pausa(15, 30)  # o Google responde "Algo deu errado" com acessos muito seguidos
                 try:
                     cal = gflights.calendario(page, dias, IDA_MIN)
                     cal = {k: v for k, v in cal.items() if no_periodo(*k)}
@@ -297,7 +297,7 @@ def coletar(cfg: dict, state: dict) -> dict:
                 if ordenado[0][0] not in alvos:
                     alvos.insert(0, ordenado[0][0])  # sempre confirma a mais barata
                 for ida, volta in alvos[:MAX_CONFIRMACOES]:
-                    pausa()
+                    pausa(15, 30)
                     try:
                         for c in gflights.confirmar(page, ida, volta):
                             if c["cia"] == "Qatar Airways":
@@ -525,6 +525,9 @@ def main() -> int:
     abaixo = [c for c in exatos if c["preco"] < cfg["limite"]]
     menor = exatos[0]["preco"] if exatos else None
     falhas = r["falhas_qatar"] + r["falhas_google"]
+    # O Google falha parcialmente de vez em quando; só é "problema" se a Qatar falhar
+    # ou se 3+ dos 5 calendários do Google falharem.
+    problema = not exatos or r["falhas_qatar"] > 0 or r["falhas_google"] >= 3
     log.info("Resumo: %d preços exatos, %d datas no calendário Google, %d abaixo do limite, menor %s, falhas %d",
              len(exatos), len(r["cal"]), len(abaixo),
              f"R$ {brl(menor)} {exatos[0]['cia']}" if exatos else "-", falhas)
@@ -559,7 +562,7 @@ def main() -> int:
 
     # ---- controle de falhas
     hoje = date.today().isoformat()
-    if not exatos or falhas > 0:
+    if problema:
         state["falhas_seguidas"] = state.get("falhas_seguidas", 0) + 1
         log.warning("Execução com falha (%d seguidas)", state["falhas_seguidas"])
         if state["falhas_seguidas"] >= 3 and state.get("ultimo_aviso_problema") != hoje:
@@ -590,8 +593,8 @@ def main() -> int:
                 state["abaixo"] = True
         else:
             log.info("Abaixo do limite, mas nada novo desde o último aviso (R$ %s)", brl(ultimo))
-    elif state.get("abaixo") and falhas == 0 and exatos:
-        # só conclui que subiu se todas as fontes carregaram
+    elif state.get("abaixo") and not problema:
+        # só conclui que subiu se as fontes carregaram
         corpo = montar_email("↑ PREÇO VOLTOU A SUBIR", VERMELHO, [
             ("Menor preço agora", f"R$ {brl(menor)}"),
             ("Companhia", cia_txt(exatos[0])),

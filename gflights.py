@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import random
 import re
 import time
 from datetime import date, timedelta
@@ -104,13 +105,19 @@ def _preco_cal(txt: str) -> float | None:
 
 def calendario(page, dias: int, ida_ref: date) -> dict[tuple[date, date], float]:
     """Abre a busca (ida_ref, ida_ref+dias) e lê o calendário 'viagens de N dias'."""
-    page.goto(url(ida_ref, ida_ref + timedelta(days=dias)), wait_until="domcontentloaded", timeout=60_000)
-    _esperar_lista(page)
+    carregar(page, url(ida_ref, ida_ref + timedelta(days=dias)))
     campo = page.get_by_role("textbox", name=re.compile("Partida|Departure"))
     js = """e => e.map(x => [x.getAttribute('data-iso') || '', x.innerText || ''])"""
     cel = []
-    for tentativa in range(3):  # o calendário às vezes não abre no 1º clique
-        campo.first.click()
+    for tentativa in range(3):  # o calendário às vezes não abre: clique, Enter, botão "Calendário"
+        if tentativa == 0:
+            campo.first.click()
+        elif tentativa == 1:
+            campo.first.click()
+            page.keyboard.press("Enter")
+        else:
+            botao = page.get_by_role("button", name=re.compile("^Calendário$|^Calendar$"))
+            (botao.first if botao.count() else campo.first).click()
         leituras, inicio = [], time.time()
         while time.time() - inicio < 25:
             cel = page.eval_on_selector_all("[role=gridcell]", js)
@@ -195,12 +202,30 @@ def _esperar_lista(page, timeout=45) -> int:
     return leituras[-1] if leituras else 0
 
 
+def carregar(page, endereco: str) -> int:
+    """Abre a busca; se o Google responder "Algo deu errado", espera e clica em Atualizar."""
+    page.goto(endereco, wait_until="domcontentloaded", timeout=60_000)
+    n = _esperar_lista(page)
+    for tentativa in range(3):
+        if n or not page.get_by_text(re.compile("Algo deu errado|Something went wrong")).count():
+            return n
+        espera = random.uniform(20, 40) * (tentativa + 1)
+        log.warning("Google respondeu 'Algo deu errado'; aguardando %.0f s e atualizando", espera)
+        time.sleep(espera)
+        botao = page.get_by_role("button", name=re.compile("Atualizar|Refresh|Reload"))
+        if botao.count():
+            botao.first.click()
+        else:
+            page.reload(wait_until="domcontentloaded")
+        n = _esperar_lista(page)
+    return n
+
+
 def confirmar(page, ida: date, volta: date) -> list[dict]:
     """Preços exatos (total 2 adultos, ida e volta, até 1 parada) por companhia."""
     voos = []
     for tentativa in range(2):  # recarrega uma vez se a lista vier vazia
-        page.goto(url(ida, volta), wait_until="domcontentloaded", timeout=60_000)
-        _esperar_lista(page)
+        carregar(page, url(ida, volta))
         aba = page.get_by_role("tab", name=re.compile("Menores preços|Cheapest"))
         if aba.count():
             aba.first.click()
