@@ -25,6 +25,7 @@ jobs:
       EMAIL_TO: ${{ secrets.EMAIL_TO }}
       LIMITE: ${{ vars.LIMITE || '17338.00' }}
       BROWSER_CHANNEL: ${{ vars.BROWSER_CHANNEL || 'chromium' }}
+      EMAIL_SEMPRE: ${{ vars.EMAIL_SEMPRE || 'true' }}
     steps:
       - uses: actions/checkout@v4
 

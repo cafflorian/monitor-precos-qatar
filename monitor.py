@@ -140,6 +140,8 @@ def config() -> dict:
         "para": [e.strip() for e in os.getenv("EMAIL_TO", "").split(",") if e.strip()],
         "limite": float(limite_txt),
         "canal": os.getenv("BROWSER_CHANNEL", "chromium").strip().lower(),
+        # true = manda um resumo a cada execução, mesmo sem nada abaixo do limite
+        "sempre": os.getenv("EMAIL_SEMPRE", "true").strip().lower() not in ("false", "0", "nao", "não", "no"),
     }
 
 
@@ -478,6 +480,43 @@ def email_alerta(cfg: dict, abaixo: list[dict], prefixo: str = "") -> bool:
     return enviar_email(cfg, assunto, corpo)
 
 
+def email_resumo(cfg: dict, r: dict, exatos: list[dict], abaixo: list[dict], teste: bool = False) -> bool:
+    """Resumo da execução: quadro com o essencial + menor preço por companhia."""
+    falhas_txt = (f"falhas: Qatar {r['falhas_qatar']}/{len(PARES)}, Google {r['falhas_google']}/5"
+                  if r["falhas_qatar"] or r["falhas_google"] else "funcionando")
+    itens = [("Status", falhas_txt)]
+    if exatos:
+        m = exatos[0]
+        itens += [
+            ("Menor preço", f"R$ {brl(m['preco'])}"),
+            ("Companhia", cia_txt(m)),
+            ("Datas", datas_txt(m)),
+            ("Situação", dif_limite(m["preco"], cfg["limite"])),
+        ]
+        if abaixo:
+            itens.append(("Abaixo do limite", f"{len(abaixo)} opção(ões), já avisadas antes"))
+    else:
+        itens.append(("Menor preço", "nenhum encontrado"))
+    itens += [
+        ("Limite", f"R$ {brl(cfg['limite'])}"),
+        ("Cobertura", f"Qatar {r['n_qatar']} células + Google {len(r['cal'])} datas"),
+        ("Verificado em", agora()),
+    ]
+    if teste:
+        titulo, assunto = "🧪 TESTE — Monitor GRU-BKK", "[TESTE] Monitor GRU-BKK funcionando"
+    else:
+        titulo = "📊 RESUMO — Monitor GRU-BKK"
+        if exatos:
+            m = exatos[0]
+            sit = "ABAIXO do limite" if abaixo else "acima do limite"
+            assunto = (f"Resumo GRU-BKK: menor R${brl(m['preco'])} {m['cia']} "
+                       f"({ddmm(m['ida'])}-{ddmm(m['volta'])}), {sit}")
+        else:
+            assunto = "Resumo GRU-BKK: nenhum preço encontrado nesta hora"
+    corpo = montar_email(titulo, AZUL, itens, por_cia(exatos), "menor preço encontrado por companhia", RODAPE)
+    return enviar_email(cfg, assunto, corpo)
+
+
 # ---------------------------------------------------------------------- main
 def por_cia(exatos: list[dict]) -> list[dict]:
     """Menor preço de cada companhia."""
@@ -541,28 +580,12 @@ def main() -> int:
         if abaixo:
             ok = email_alerta(cfg, abaixo, prefixo="[TESTE] ")
         else:
-            itens = [("Status", "funcionando" if falhas == 0 else
-                      f"falhas: Qatar {r['falhas_qatar']}/{len(PARES)}, Google {r['falhas_google']}/5")]
-            if exatos:
-                itens += [
-                    ("Menor preço", f"R$ {brl(menor)}"),
-                    ("Companhia", cia_txt(exatos[0])),
-                    ("Datas", datas_txt(exatos[0])),
-                    ("Situação", dif_limite(menor, cfg["limite"])),
-                ]
-            else:
-                itens.append(("Menor preço", "nenhum encontrado"))
-            itens += [
-                ("Limite", f"R$ {brl(cfg['limite'])}"),
-                ("Cobertura", f"Qatar {r['n_qatar']} células + Google {len(r['cal'])} datas"),
-                ("Verificado em", agora()),
-            ]
-            corpo = montar_email("🧪 TESTE — Monitor GRU-BKK", AZUL, itens, por_cia(exatos),
-                                 "menor preço encontrado por companhia", RODAPE)
-            ok = enviar_email(cfg, "[TESTE] Monitor GRU-BKK funcionando", corpo)
+            ok = email_resumo(cfg, r, exatos, abaixo, teste=True)
         print("E-mail de teste:", "ENVIADO" if ok else "NÃO ENVIADO (veja logs/monitor.log)")
         salvar_state(state)
         return 0
+
+    enviou = False  # algum e-mail (alerta, problema, voltou a subir) saiu nesta execução?
 
     # ---- controle de falhas
     hoje = date.today().isoformat()
@@ -579,6 +602,7 @@ def main() -> int:
             ], rodape="Este aviso é enviado no máximo 1 vez por dia.")
             if enviar_email(cfg, "Monitor GRU-BKK com problema", corpo):
                 state["ultimo_aviso_problema"] = hoje
+                enviou = True
     else:
         state["falhas_seguidas"] = 0
 
@@ -595,6 +619,7 @@ def main() -> int:
                 state["menor_avisado"] = menor
                 state["combos_avisadas"] = sorted(avisadas | chaves)
                 state["abaixo"] = True
+                enviou = True
         else:
             log.info("Abaixo do limite, mas nada novo desde o último aviso (R$ %s)", brl(ultimo))
     elif state.get("abaixo") and not problema:
@@ -609,6 +634,11 @@ def main() -> int:
         ], por_cia(exatos), "menor preço agora por companhia", RODAPE)
         if enviar_email(cfg, f"GRU-BKK voltou a subir: menor R${brl(menor)}", corpo):
             state.update(abaixo=False, menor_avisado=None, combos_avisadas=[])
+            enviou = True
+
+    # ---- resumo horário (quando nenhum outro e-mail saiu nesta execução)
+    if cfg["sempre"] and not enviou:
+        email_resumo(cfg, r, exatos, abaixo)
 
     state["ultima_execucao"] = datetime.now().isoformat(timespec="seconds")
     state["ultimo_menor"] = menor
