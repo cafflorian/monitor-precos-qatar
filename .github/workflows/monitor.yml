@@ -15,7 +15,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # O disparo principal vem do cron-job.org (workflow_dispatch nas horas cheias).
+  # O cron do GitHub é só reserva: se já houve execução nos últimos 45 min, ele não roda.
+  checar:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      rodar: ${{ steps.c.outputs.rodar }}
+    steps:
+      - id: c
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then echo "rodar=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          desde=$(date -u -d '45 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+          n=$(gh api --method GET "repos/${{ github.repository }}/actions/workflows/monitor.yml/runs" \
+                -f created=">=$desde" -f per_page=20 \
+                --jq "[.workflow_runs[] | select(.id != ${{ github.run_id }} and .conclusion != \"skipped\")] | length")
+          if [ "$n" -gt 0 ]; then
+            echo "Já houve $n execução(ões) desde $desde; disparo do cron do GitHub ignorado."
+            echo "rodar=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "rodar=true" >> "$GITHUB_OUTPUT"
+          fi
+
   monitor:
+    needs: checar
+    if: needs.checar.outputs.rodar == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     env:
