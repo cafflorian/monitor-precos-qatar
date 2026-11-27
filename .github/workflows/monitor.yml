@@ -26,6 +26,7 @@ jobs:
       LIMITE: ${{ vars.LIMITE || '17338.00' }}
       BROWSER_CHANNEL: ${{ vars.BROWSER_CHANNEL || 'chromium' }}
       EMAIL_SEMPRE: ${{ vars.EMAIL_SEMPRE || 'true' }}
+      GOOGLE_A_CADA_HORAS: ${{ vars.GOOGLE_A_CADA_HORAS || '3' }}
     steps:
       - uses: actions/checkout@v4
 

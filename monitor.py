@@ -26,6 +26,7 @@ import re
 import smtplib
 import ssl
 import sys
+import shutil
 import time
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
@@ -142,6 +143,8 @@ def config() -> dict:
         "canal": os.getenv("BROWSER_CHANNEL", "chromium").strip().lower(),
         # true = manda um resumo a cada execução, mesmo sem nada abaixo do limite
         "sempre": os.getenv("EMAIL_SEMPRE", "true").strip().lower() not in ("false", "0", "nao", "não", "no"),
+        # consulta o Google Flights só nas horas múltiplas disto (0h, 3h, 6h...)
+        "google_horas": max(1, int(os.getenv("GOOGLE_A_CADA_HORAS", "3") or 3)),
     }
 
 
@@ -244,12 +247,14 @@ def combos_qatar(celulas) -> list[dict]:
 
 
 # -------------------------------------------------------------------- coleta
-def coletar(cfg: dict, state: dict) -> dict:
-    """Retorna dict com combos exatos, calendário Google e contadores de falha."""
+def coletar(cfg: dict, state: dict, google: bool = True) -> dict:
+    """Retorna dict com combos exatos, calendário Google e contadores de falha.
+    google=False pula o Google Flights (ele limita acessos vindos do GitHub)."""
     import gflights
     from playwright.sync_api import sync_playwright
 
-    r = {"exatos": [], "cal": {}, "n_qatar": 0, "falhas_qatar": 0, "falhas_google": 0, "confirmacoes": 0}
+    r = {"exatos": [], "cal": {}, "n_qatar": 0, "falhas_qatar": 0, "falhas_google": 0, "confirmacoes": 0,
+         "google": google}
     canal = state.get("canal") or cfg["canal"]
     with sync_playwright() as p:
         ctx = abrir_contexto(p, canal)
@@ -275,25 +280,24 @@ def coletar(cfg: dict, state: dict) -> dict:
             r["n_qatar"] = len(celulas)
             r["exatos"].extend(combos_qatar(celulas))
 
+            if not google:
+                log.info("Google Flights não consultado nesta hora (a cada %d h)", cfg["google_horas"])
+                return r
+
             # ---- 2. Google Flights: calendário por duração (triagem)
             page = ctx.pages[0]
             for dias in range(DIAS_MIN, DIAS_MAX + 1):
                 pausa(15, 30)  # o Google responde "Algo deu errado" com acessos muito seguidos
                 try:
                     cal = gflights.calendario(page, dias, IDA_MIN)
-                    if len(cal) < 40:  # costuma falhar no 1º acesso; tenta a página de novo
-                        log.warning("Calendário %d dias vazio; recarregando a busca", dias)
-                        pausa(15, 30)
-                        cal = gflights.calendario(page, dias, IDA_MIN)
                     cal = {k: v for k, v in cal.items() if no_periodo(*k)}
                     log.info("Google calendário %d dias: %d datas", dias, len(cal))
                     if len(cal) < 40:
                         r["falhas_google"] += 1
-                        salvar_debug(page, f"google_cal_{dias}")
                     r["cal"].update(cal)
                 except Exception as e:
                     log.error("Erro no calendário Google %d dias: %s", dias, e)
-                    salvar_debug(page, f"google_cal_{dias}")
+                    salvar_debug(page, f"google_cal_{dias}_erro")
                     r["falhas_google"] += 1
 
             # ---- 3. Google Flights: confirmação (preço exato + companhia)
@@ -302,6 +306,14 @@ def coletar(cfg: dict, state: dict) -> dict:
                 alvos = [k for k, v in ordenado if v - FOLGA_ARREDONDAMENTO < cfg["limite"]]
                 if ordenado[0][0] not in alvos:
                     alvos.insert(0, ordenado[0][0])  # sempre confirma a mais barata
+            else:
+                # sem calendário: confirma as datas mais baratas da última consulta ao Google
+                ant = sorted(state.get("google_ultimo", {}).get("itens", []), key=lambda c: c["preco"])
+                alvos = list(dict.fromkeys((date.fromisoformat(c["ida"]), date.fromisoformat(c["volta"]))
+                                           for c in ant))
+                if alvos:
+                    log.info("Calendário indisponível; confirmando datas da última consulta ao Google")
+            if alvos:
                 for ida, volta in alvos[:MAX_CONFIRMACOES]:
                     pausa(15, 30)
                     try:
@@ -480,11 +492,31 @@ def email_alerta(cfg: dict, abaixo: list[dict], prefixo: str = "") -> bool:
     return enviar_email(cfg, assunto, corpo)
 
 
-def email_resumo(cfg: dict, r: dict, exatos: list[dict], abaixo: list[dict], teste: bool = False) -> bool:
+def email_resumo(cfg: dict, r: dict, exatos: list[dict], abaixo: list[dict], state: dict,
+                 teste: bool = False) -> bool:
     """Resumo da execução: quadro com o essencial + menor preço por companhia."""
     falhas_txt = (f"falhas: Qatar {r['falhas_qatar']}/{len(PARES)}, Google {r['falhas_google']}/5"
                   if r["falhas_qatar"] or r["falhas_google"] else "funcionando")
     itens = [("Status", falhas_txt)]
+    tabela = por_cia(exatos)
+    if r.get("google"):
+        google_txt = f"consultado agora ({len(r['cal'])} datas no calendário, {r['confirmacoes']} buscas)"
+    else:
+        h = cfg["google_horas"]
+        prox = (datetime.now().hour // h + 1) * h % 24
+        ult = state.get("google_ultimo")
+        if ult:
+            quando = datetime.fromisoformat(ult["quando"])
+            google_txt = f"última consulta às {quando:%H:%M} de {quando:%d/%m}; próxima às {prox:02d}:00"
+            vistas = {c["cia"] for c in tabela}
+            for c in ult["itens"]:  # companhias que só o Google mostra, com o preço da última consulta
+                if c["cia"] not in vistas:
+                    tabela.append({**c, "ida": date.fromisoformat(c["ida"]), "volta": date.fromisoformat(c["volta"]),
+                                   "cia": c["cia"], "conexao": f"{c['conexao']}, às {quando:%H:%M}"})
+            tabela.sort(key=lambda c: c["preco"])
+        else:
+            google_txt = f"não consultado nesta hora; próxima às {prox:02d}:00"
+    itens.append(("Outras companhias", google_txt))
     if exatos:
         m = exatos[0]
         itens += [
@@ -499,7 +531,8 @@ def email_resumo(cfg: dict, r: dict, exatos: list[dict], abaixo: list[dict], tes
         itens.append(("Menor preço", "nenhum encontrado"))
     itens += [
         ("Limite", f"R$ {brl(cfg['limite'])}"),
-        ("Cobertura", f"Qatar {r['n_qatar']} células + Google {len(r['cal'])} datas"),
+        ("Cobertura", f"Qatar {r['n_qatar']} células" +
+                      (f" + Google {len(r['cal'])} datas" if r.get("google") else "")),
         ("Verificado em", agora()),
     ]
     if teste:
@@ -513,7 +546,7 @@ def email_resumo(cfg: dict, r: dict, exatos: list[dict], abaixo: list[dict], tes
                        f"({ddmm(m['ida'])}-{ddmm(m['volta'])}), {sit}")
         else:
             assunto = "Resumo GRU-BKK: nenhum preço encontrado nesta hora"
-    corpo = montar_email(titulo, AZUL, itens, por_cia(exatos), "menor preço encontrado por companhia", RODAPE)
+    corpo = montar_email(titulo, AZUL, itens, tabela, "menor preço encontrado por companhia", RODAPE)
     return enviar_email(cfg, assunto, corpo)
 
 
@@ -556,12 +589,24 @@ def main() -> int:
     state = carregar_state()
     log.info("Início da execução%s (limite R$ %s)", " [TESTE]" if args.teste else "", brl(cfg["limite"]))
 
+    # capturas de falha só desta execução
+    shutil.rmtree(DEBUG_DIR, ignore_errors=True)
+    google = args.teste or datetime.now().hour % cfg["google_horas"] == 0
+
     try:
-        r = coletar(cfg, state)
+        r = coletar(cfg, state, google=google)
     except Exception as e:
         log.exception("Erro geral na coleta: %s", e)
         r = {"exatos": [], "cal": {}, "n_qatar": 0, "falhas_qatar": len(PARES),
-             "falhas_google": DIAS_MAX - DIAS_MIN + 1, "confirmacoes": 0}
+             "falhas_google": DIAS_MAX - DIAS_MIN + 1 if google else 0, "confirmacoes": 0, "google": google}
+
+    # guarda o resultado do Google para mostrar nos resumos das horas sem consulta
+    do_google = [c for c in r["exatos"] if c["fonte"] == "Google Flights"]
+    if do_google:
+        state["google_ultimo"] = {
+            "quando": datetime.now().isoformat(timespec="minutes"),
+            "itens": [{**c, "ida": c["ida"].isoformat(), "volta": c["volta"].isoformat()} for c in por_cia(do_google)],
+        }
 
     exatos = sorted(r["exatos"], key=lambda c: (c["preco"], c["ida"], c["cia"]))
     salvar_csv(exatos, r["cal"])
@@ -570,7 +615,8 @@ def main() -> int:
     falhas = r["falhas_qatar"] + r["falhas_google"]
     # O Google falha parcialmente de vez em quando; só é "problema" se a Qatar falhar
     # ou se 3+ dos 5 calendários do Google falharem.
-    problema = not exatos or r["falhas_qatar"] > 0 or r["falhas_google"] >= 3
+    problema = not exatos or r["falhas_qatar"] > 0 or (r["google"] and r["falhas_google"] >= 3 and not
+                                                       any(c["fonte"] == "Google Flights" for c in exatos))
     log.info("Resumo: %d preços exatos, %d datas no calendário Google, %d abaixo do limite, menor %s, falhas %d",
              len(exatos), len(r["cal"]), len(abaixo),
              f"R$ {brl(menor)} {exatos[0]['cia']}" if exatos else "-", falhas)
@@ -580,7 +626,7 @@ def main() -> int:
         if abaixo:
             ok = email_alerta(cfg, abaixo, prefixo="[TESTE] ")
         else:
-            ok = email_resumo(cfg, r, exatos, abaixo, teste=True)
+            ok = email_resumo(cfg, r, exatos, abaixo, state, teste=True)
         print("E-mail de teste:", "ENVIADO" if ok else "NÃO ENVIADO (veja logs/monitor.log)")
         salvar_state(state)
         return 0
@@ -638,7 +684,7 @@ def main() -> int:
 
     # ---- resumo horário (quando nenhum outro e-mail saiu nesta execução)
     if cfg["sempre"] and not enviou:
-        email_resumo(cfg, r, exatos, abaixo)
+        email_resumo(cfg, r, exatos, abaixo, state)
 
     state["ultima_execucao"] = datetime.now().isoformat(timespec="seconds")
     state["ultimo_menor"] = menor

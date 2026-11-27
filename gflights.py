@@ -109,12 +109,9 @@ def calendario(page, dias: int, ida_ref: date) -> dict[tuple[date, date], float]
     campo = page.get_by_role("textbox", name=re.compile("Partida|Departure"))
     js = """e => e.map(x => [x.getAttribute('data-iso') || '', x.innerText || ''])"""
     cel = []
-    for tentativa in range(3):  # o calendário às vezes não abre: clique, Enter, botão "Calendário"
+    for tentativa in range(2):  # 1º clique no campo; se não vier preço, botão "Calendário"
         if tentativa == 0:
             campo.first.click()
-        elif tentativa == 1:
-            campo.first.click()
-            page.keyboard.press("Enter")
         else:
             botao = page.get_by_role("button", name=re.compile("^Calendário$|^Calendar$"))
             (botao.first if botao.count() else campo.first).click()
@@ -128,7 +125,10 @@ def calendario(page, dias: int, ida_ref: date) -> dict[tuple[date, date], float]
             page.wait_for_timeout(1500)
         if leituras and leituras[-1] >= 40:
             break
-        log.warning("Calendário %d dias não abriu (tentativa %d), clicando de novo", dias, tentativa + 1)
+        aberto = page.locator("[role=gridcell]").count() > 0
+        log.warning("Calendário %d dias sem preços (tentativa %d; calendário %s)", dias, tentativa + 1,
+                    "aberto, mas sem preços" if aberto else "não abriu")
+        _captura(page, f"google_cal_{dias}_{tentativa}")  # antes do Escape, para ver o estado real
         page.keyboard.press("Escape")
         page.wait_for_timeout(2000)
     out = {}
@@ -202,14 +202,22 @@ def _esperar_lista(page, timeout=45) -> int:
     return leituras[-1] if leituras else 0
 
 
+def _captura(page, nome: str) -> None:
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(DEBUG_DIR / f"falha_{nome}.png"))
+    except Exception:
+        pass
+
+
 def carregar(page, endereco: str) -> int:
-    """Abre a busca; se o Google responder "Algo deu errado", espera e clica em Atualizar."""
+    """Abre a busca; se o Google responder "Algo deu errado", espera e tenta UMA vez mais."""
     page.goto(endereco, wait_until="domcontentloaded", timeout=60_000)
     n = _esperar_lista(page)
-    for tentativa in range(3):
+    for tentativa in range(1):  # insistir piora a limitação do Google
         if n or not page.get_by_text(re.compile("Algo deu errado|Something went wrong")).count():
             return n
-        espera = random.uniform(20, 40) * (tentativa + 1)
+        espera = random.uniform(30, 45)
         log.warning("Google respondeu 'Algo deu errado'; aguardando %.0f s e atualizando", espera)
         time.sleep(espera)
         botao = page.get_by_role("button", name=re.compile("Atualizar|Refresh|Reload"))
@@ -223,21 +231,15 @@ def carregar(page, endereco: str) -> int:
 
 def confirmar(page, ida: date, volta: date) -> list[dict]:
     """Preços exatos (total 2 adultos, ida e volta, até 1 parada) por companhia."""
-    voos = []
-    for tentativa in range(2):  # recarrega uma vez se a lista vier vazia
-        carregar(page, url(ida, volta))
-        aba = page.get_by_role("tab", name=re.compile("Menores preços|Cheapest"))
-        if aba.count():
-            aba.first.click()
-            _esperar_lista(page, timeout=20)
-        voos = _parse_lista(page.inner_text("body"))
-        if voos:
-            break
-        log.warning("Lista Google %s/%s vazia (tentativa %d)", ida, volta, tentativa + 1)
-        try:
-            page.screenshot(path=str(DEBUG_DIR / f"falha_google_conf_{ida}_{tentativa}.png"))
-        except Exception:
-            pass
+    carregar(page, url(ida, volta))
+    aba = page.get_by_role("tab", name=re.compile("Menores preços|Cheapest"))
+    if aba.count():
+        aba.first.click()
+        _esperar_lista(page, timeout=20)
+    voos = _parse_lista(page.inner_text("body"))
+    if not voos:
+        log.warning("Lista Google %s/%s vazia", ida, volta)
+        _captura(page, f"google_conf_{ida}_{volta}")
     melhores: dict[str, dict] = {}
     for v in voos:
         if v["paradas"] > 1 or v["premium"]:
