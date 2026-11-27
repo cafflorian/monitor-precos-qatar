@@ -2,7 +2,7 @@ name: Monitor GRU-BKK
 
 on:
   schedule:
-    - cron: "17 * * * *"   # a cada hora, no minuto 17 (UTC) - evita o pico do minuto 0
+    - cron: "0 * * * *"   # a cada hora cheia (o GitHub pode atrasar alguns minutos)
   workflow_dispatch:
     inputs:
       teste:
